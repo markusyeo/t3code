@@ -54,6 +54,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   ProviderAdapterRequestError,
+  ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderUnsupportedError,
   ProviderValidationError,
@@ -143,27 +144,28 @@ function makeFakeCodexAdapter(
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
-  const startSession = vi.fn((input: ProviderSessionStartInput) =>
-    Effect.sync(() => {
-      const now = "2026-01-01T00:00:00.000Z";
-      const session: ProviderSession = {
-        provider,
-        ...(input.providerInstanceId !== undefined
-          ? { providerInstanceId: input.providerInstanceId }
-          : {}),
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        threadId: input.threadId,
-        resumeCursor: input.resumeCursor ?? {
-          opaque: `resume-${String(input.threadId)}`,
-        },
-        cwd: input.cwd ?? process.cwd(),
-        createdAt: now,
-        updatedAt: now,
-      };
-      sessions.set(session.threadId, session);
-      return session;
-    }),
+  const startSession = vi.fn(
+    (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+      Effect.sync(() => {
+        const now = "2026-01-01T00:00:00.000Z";
+        const session: ProviderSession = {
+          provider,
+          ...(input.providerInstanceId !== undefined
+            ? { providerInstanceId: input.providerInstanceId }
+            : {}),
+          status: "ready",
+          runtimeMode: input.runtimeMode,
+          threadId: input.threadId,
+          resumeCursor: input.resumeCursor ?? {
+            opaque: `resume-${String(input.threadId)}`,
+          },
+          cwd: input.cwd ?? process.cwd(),
+          createdAt: now,
+          updatedAt: now,
+        };
+        sessions.set(session.threadId, session);
+        return session;
+      }),
   );
 
   const sendTurn = vi.fn(
@@ -1755,6 +1757,65 @@ routing.layer("ProviderServiceLive routing", (it) => {
         assert.equal(startPayload.threadId, session.threadId);
       }
       assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("retries once then falls back to a fresh session when resume stays closed", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-fallback-closed-session");
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("project"),
+        runtimeMode: "full-access",
+      });
+
+      const initialCursor = { threadId: "persisted-resume-cursor-closed" };
+      routing.codex.updateSession(threadId, (s) => ({
+        ...s,
+        resumeCursor: initialCursor,
+      }));
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const binding = yield* directory.getBinding(threadId);
+      assert(Option.isSome(binding));
+      yield* directory.upsert({
+        ...binding.value,
+        resumeCursor: initialCursor,
+      });
+
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+
+      const originalStartSession = routing.codex.startSession.getMockImplementation();
+      routing.codex.startSession.mockImplementation((input) => {
+        if (input.resumeCursor) {
+          return Effect.fail(
+            new ProviderAdapterSessionClosedError({
+              provider: "antigravity",
+              threadId,
+              cause: "received 1000 (OK); then sent 1000 (OK)",
+            }),
+          );
+        }
+        return originalStartSession!(input);
+      });
+
+      yield* provider.sendTurn({
+        threadId,
+        input: "retry after clean close",
+        attachments: [],
+      });
+
+      assert.equal(routing.codex.startSession.mock.calls.length, 3);
+      const firstCall = routing.codex.startSession.mock.calls[0]?.[0];
+      const retryCall = routing.codex.startSession.mock.calls[1]?.[0];
+      const fallbackCall = routing.codex.startSession.mock.calls[2]?.[0];
+      assert.deepEqual(firstCall?.resumeCursor, initialCursor);
+      assert.deepEqual(retryCall?.resumeCursor, initialCursor);
+      assert.equal(fallbackCall?.resumeCursor, undefined);
+      routing.codex.startSession.mockImplementation(originalStartSession!);
     }),
   );
 

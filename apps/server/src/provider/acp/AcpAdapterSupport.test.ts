@@ -2,7 +2,11 @@ import { describe, expect, it } from "vite-plus/test";
 import * as EffectAcpErrors from "effect-acp/errors";
 import { ProviderDriverKind } from "@t3tools/contracts";
 
-import { acpPermissionOutcome, mapAcpToAdapterError } from "./AcpAdapterSupport.ts";
+import {
+  ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE,
+  acpPermissionOutcome,
+  mapAcpToAdapterError,
+} from "./AcpAdapterSupport.ts";
 
 describe("AcpAdapterSupport", () => {
   it("maps ACP approval decisions to permission outcomes", () => {
@@ -70,9 +74,7 @@ describe("AcpAdapterSupport", () => {
 
     expect(error._tag).toBe("ProviderAdapterRequestError");
     if (error._tag === "ProviderAdapterRequestError") {
-      expect(error.detail).toBe(
-        "The Antigravity stream was interrupted by the local proxy (EOF). Please try again.",
-      );
+      expect(error.detail).toBe(ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE);
     }
   });
 });

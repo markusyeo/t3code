@@ -50,7 +50,10 @@ import {
   ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
   isAntigravitySignInRequiredError,
 } from "../antigravityAuthSupport.ts";
-import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import {
+  ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE,
+  mapAcpToAdapterError,
+} from "../acp/AcpAdapterSupport.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
@@ -1137,13 +1140,25 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         isAcpError(cause) ? mapAntigravityError(input.threadId, "session/prompt", cause) : cause,
       ),
       Effect.tapError((cause) =>
-        Effect.suspend(() =>
-          intent
+        Effect.suspend(() => {
+          const stop =
+            cause._tag === "ProviderAdapterSessionClosedError" ||
+            (cause._tag === "ProviderAdapterRequestError" &&
+              cause.detail === ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE)
+              ? Effect.gen(function* () {
+                  context.stopped = true;
+                  context.disconnected = true;
+                  yield* stopContext(context);
+                })
+              : Effect.void;
+          return intent
             ? context.promptLock.withPermit(
-                finishTurn(intent, { state: "failed", errorMessage: cause.message }),
+                finishTurn(intent, { state: "failed", errorMessage: cause.message }).pipe(
+                  Effect.andThen(stop),
+                ),
               )
-            : Effect.void,
-        ),
+            : stop;
+        }),
       ),
       Effect.onInterrupt(() =>
         context.promptLock.withPermit(

@@ -31,6 +31,7 @@ import {
   parseSessionUpdateEvent,
   type AcpToolCallState,
 } from "../acp/AcpRuntimeModel.ts";
+import { ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE } from "../acp/AcpAdapterSupport.ts";
 import { makeAntigravityAdapter, type AntigravityAdapterOptions } from "./AntigravityAdapter.ts";
 
 const instanceId = ProviderInstanceId.make("antigravity-test");
@@ -1207,6 +1208,64 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         Exit.isFailure(yield* h.adapter.sendTurn({ threadId, input: "Hello" }).pipe(Effect.exit)),
       ).toBe(true);
     }),
+  );
+
+  it.effect("cleans up session when prompt encounters clean websocket close", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const promptFiber = yield* h.adapter
+        .sendTurn({ threadId, input: "Hello" })
+        .pipe(Effect.forkChild);
+      const prompt = yield* h.nextPrompt;
+      yield* Deferred.fail(
+        prompt.result,
+        new AcpErrors.AcpRequestError({
+          code: -32603,
+          errorMessage: "received 1000 (OK); then sent 1000 (OK)",
+        }),
+      );
+      const result = yield* Fiber.await(promptFiber);
+      expect(Exit.isFailure(result)).toBe(true);
+      const turnEnd = yield* h.waitForEvent((event) => event.type === "turn.completed");
+      expect(turnEnd.payload.state).toBe("failed");
+      const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
+      expect(exited.payload.exitKind).toBe("error");
+      expect(yield* h.adapter.hasSession(threadId)).toBe(false);
+    }),
+  );
+
+  it.effect(
+    "replaces a dropped streamGenerateContent transport error with a readable message and cleans up session",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Keep going" })
+          .pipe(Effect.flip, Effect.forkChild);
+        const prompt = yield* h.nextPrompt;
+        yield* Deferred.fail(
+          prompt.result,
+          AcpErrors.AcpRequestError.internalError(
+            'model unreachable: doRequest: error sending request: Post "http://127.0.0.1:1/v1beta1/projects/redacted/locations/us/publishers/google/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse": EOF',
+          ),
+        );
+        const failure = yield* Fiber.join(sending);
+        expect(failure._tag).toBe("ProviderAdapterRequestError");
+        expect(failure.message).toContain(ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE);
+        expect(failure.message).not.toContain("doRequest");
+        expect(failure.message).not.toContain("EOF");
+        expect(yield* h.adapter.hasSession(threadId)).toBe(false);
+      }),
   );
 
   it.effect("reports hidden login requests as sign-in required and clears account metadata", () =>
