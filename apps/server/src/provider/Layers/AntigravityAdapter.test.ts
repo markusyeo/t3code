@@ -209,7 +209,9 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
       yield* Queue.offer(cancellations, prompt.index);
       if (options?.holdCancel) yield* Deferred.await(cancelRelease);
       yield* Deferred.succeed(prompt.result, { stopReason: "cancelled" });
-      yield* Deferred.await(prompt.result);
+      // Best-effort like a real cancel: if the prompt already settled (for
+      // example it failed with a disconnect), do not adopt that outcome here.
+      yield* Deferred.await(prompt.result).pipe(Effect.ignore);
       yield* drainEvents;
       calls.push(`drained:${prompt.index}`);
     }),
@@ -1236,6 +1238,57 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
       expect(exited.payload.exitKind).toBe("error");
       expect(yield* h.adapter.hasSession(threadId)).toBe(false);
+    }),
+  );
+
+  it.effect("keeps a superseding turn alive when the superseded prompt hits a clean close", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ holdCancel: true });
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const first = yield* h.adapter
+        .sendTurn({ threadId, input: "First prompt" })
+        .pipe(Effect.forkChild);
+      const firstPrompt = yield* h.nextPrompt;
+      // The second turn steers, bumping context.generation and holding at the
+      // native cancel, so the first turn no longer owns the context.
+      const second = yield* h.adapter
+        .sendTurn({
+          threadId,
+          input: "Steer the turn",
+          modelSelection: { instanceId, model: nativeAlternative },
+        })
+        .pipe(Effect.forkChild);
+      expect(yield* h.nextCancellation).toBe(1);
+      // The superseded prompt now fails with a clean websocket close. A
+      // generation-unaware teardown would stop the shared context here and kill
+      // the steering turn instead of leaving it to run.
+      yield* Deferred.fail(
+        firstPrompt.result,
+        new AcpErrors.AcpRequestError({
+          code: -32603,
+          errorMessage: "received 1000 (OK); then sent 1000 (OK)",
+        }),
+      );
+      yield* Deferred.succeed(h.cancelRelease, undefined);
+      const replacement = yield* h.nextPrompt;
+      expect(replacement.content).toEqual([
+        { type: "text", text: "Steer the turn" },
+        {
+          type: "text",
+          text: expect.stringContaining(`Antigravity harness, as ${nativeAlternative}`),
+        },
+      ]);
+      yield* Deferred.succeed(replacement.result, { stopReason: "end_turn" });
+      const [firstExit, secondExit] = yield* Effect.all([Fiber.await(first), Fiber.await(second)], {
+        concurrency: "unbounded",
+      });
+      expect(Exit.isFailure(firstExit)).toBe(true);
+      expect(Exit.isSuccess(secondExit)).toBe(true);
+      expect(yield* h.adapter.hasSession(threadId)).toBe(true);
     }),
   );
 

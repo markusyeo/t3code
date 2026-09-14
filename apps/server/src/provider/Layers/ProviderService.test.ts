@@ -79,6 +79,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -1802,20 +1803,38 @@ routing.layer("ProviderServiceLive routing", (it) => {
         return originalStartSession!(input);
       });
 
+      // Stands in for the MCP session prepared before recovery. A per-attempt
+      // clear would delete it on the failed resume and never re-prepare it, so
+      // its survival proves the fresh session keeps its MCP endpoint and tools.
+      McpProviderSession.setMcpProviderSession({
+        environmentId: EnvironmentId.make("source-environment/remote"),
+        threadId,
+        providerSessionId: "mcp-provider-session-fallback",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1:0/mcp",
+        authorizationHeader: "Bearer test",
+        capabilities: new Set(),
+      });
+
       yield* provider.sendTurn({
         threadId,
         input: "retry after clean close",
         attachments: [],
       });
 
-      assert.equal(routing.codex.startSession.mock.calls.length, 3);
-      const firstCall = routing.codex.startSession.mock.calls[0]?.[0];
-      const retryCall = routing.codex.startSession.mock.calls[1]?.[0];
-      const fallbackCall = routing.codex.startSession.mock.calls[2]?.[0];
-      assert.deepEqual(firstCall?.resumeCursor, initialCursor);
-      assert.deepEqual(retryCall?.resumeCursor, initialCursor);
-      assert.equal(fallbackCall?.resumeCursor, undefined);
+      const mcpSessionAfterRecovery = McpProviderSession.readMcpProviderSession(threadId);
+      McpProviderSession.clearMcpProviderSession(threadId);
+      const calls = routing.codex.startSession.mock.calls.map((call) => call[0]);
       routing.codex.startSession.mockImplementation(originalStartSession!);
+
+      assert.equal(calls.length, 3);
+      assert.deepEqual(calls[0]?.resumeCursor, initialCursor);
+      assert.deepEqual(calls[1]?.resumeCursor, initialCursor);
+      assert.equal(calls[2]?.resumeCursor, undefined);
+      assert(
+        mcpSessionAfterRecovery !== undefined,
+        "MCP session must survive a successful fresh-session fallback",
+      );
     }),
   );
 

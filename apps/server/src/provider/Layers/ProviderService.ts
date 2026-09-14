@@ -1281,13 +1281,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ...(cursor ? { resumeCursor: cursor } : {}),
             runtimeMode: input.binding.runtimeMode ?? "full-access",
           }),
-        ).pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        );
 
       // A clean provider close (websocket 1000, "Failed to rebuild agent") is
       // classified to ProviderAdapterSessionClosedError at the adapter boundary
       // (see mapAcpToAdapterError). Retry the resume once to ride out a transient
       // rebuild and keep the resume cursor, then drop to a fresh session so a
-      // stale cursor never fails the turn outright.
+      // stale cursor never fails the turn outright. Clear the MCP session only
+      // when the whole recovery fails, so a successful retry or fallback keeps
+      // the endpoint and tools prepared above.
       const resumeClosed = (error: ProviderAdapterError) =>
         error._tag === "ProviderAdapterSessionClosedError";
       const { session: resumed, strategy } = yield* startSessionAttempt(
@@ -1304,6 +1306,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             Effect.map((session) => ({ session, strategy: "fresh-session-fallback" as const })),
           ),
         ),
+        Effect.onError(() => clearMcpSession(input.binding.threadId)),
       );
       if (resumed.provider !== adapter.provider) {
         yield* clearMcpSession(input.binding.threadId);

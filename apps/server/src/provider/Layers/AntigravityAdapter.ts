@@ -1140,25 +1140,27 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         isAcpError(cause) ? mapAntigravityError(input.threadId, "session/prompt", cause) : cause,
       ),
       Effect.tapError((cause) =>
-        Effect.suspend(() => {
-          const stop =
-            cause._tag === "ProviderAdapterSessionClosedError" ||
-            (cause._tag === "ProviderAdapterRequestError" &&
-              cause.detail === ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE)
-              ? Effect.gen(function* () {
-                  context.stopped = true;
-                  context.disconnected = true;
-                  yield* stopContext(context);
-                })
-              : Effect.void;
-          return intent
-            ? context.promptLock.withPermit(
-                finishTurn(intent, { state: "failed", errorMessage: cause.message }).pipe(
-                  Effect.andThen(stop),
-                ),
-              )
-            : stop;
-        }),
+        context.promptLock.withPermit(
+          Effect.gen(function* () {
+            if (!intent) return;
+            // Whether this failed turn still owns the context. A newer turn may
+            // have taken over (bumping context.generation), and tearing the
+            // session down for a superseded turn would interrupt it. Mirrors the
+            // generation guard in onInterrupt below.
+            const ownsContext =
+              !intent.settled && !context.stopped && context.generation === intent.generation;
+            yield* finishTurn(intent, { state: "failed", errorMessage: cause.message });
+            const disconnected =
+              cause._tag === "ProviderAdapterSessionClosedError" ||
+              (cause._tag === "ProviderAdapterRequestError" &&
+                cause.detail === ANTIGRAVITY_STREAM_DISCONNECTED_MESSAGE);
+            if (ownsContext && disconnected) {
+              context.stopped = true;
+              context.disconnected = true;
+              yield* stopContext(context);
+            }
+          }),
+        ),
       ),
       Effect.onInterrupt(() =>
         context.promptLock.withPermit(
